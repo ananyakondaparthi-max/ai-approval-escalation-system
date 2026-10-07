@@ -1,0 +1,2174 @@
+﻿
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\celery_app.py =====
+
+from celery import Celery
+from celery.schedules import crontab
+
+celery_app = Celery(
+    "approval_system",
+    broker="redis://localhost:6379/0",
+    backend="redis://localhost:6379/0",
+    include=["tasks.escalation", "tasks.notifications"]
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+)
+
+# Beat Schedule - runs check_and_escalate every hour
+celery_app.conf.beat_schedule = {
+    "check-escalations-every-hour": {
+        "task": "tasks.escalation.check_and_escalate",
+        "schedule": crontab(),  # Every hour
+    },
+}
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\config.py =====
+
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    APP_NAME: str = "University ERP API"
+    DATABASE_URL: str = "sqlite:///./erp.db"
+    SECRET_KEY: str = "change-this-secret-key"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+
+    # Email settings (leave empty to print emails in the terminal instead)
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+
+    # Escalation settings
+    ESCALATION_HOURS: int = 24
+
+    # False = send emails directly (no Redis needed). True = use Celery + Redis.
+    USE_CELERY: bool = False
+
+    class Config:
+        env_file = ".env"
+
+
+settings = Settings()
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\database.py =====
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+from config import settings
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\Dockerfile =====
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\main.py =====
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+import models  # noqa: F401  (registers the shared and leave tables)
+import po_models  # noqa: F401  (registers the purchase order tables)
+from database import Base, engine
+from routers import admin, auth, leave_balance, outflows, purchase_orders, requests, users
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title="University ERP API",
+    description="Leave requests, purchase orders and shared workflow services",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(requests.router)
+app.include_router(leave_balance.router)
+app.include_router(purchase_orders.router)
+app.include_router(admin.router)
+app.include_router(outflows.router)
+
+
+@app.get("/")
+def root():
+    return {"message": "University ERP API is running"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/app", StaticFiles(directory="frontend", html=True), name="frontend")
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\models.py =====
+
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Integer, Enum, Float
+from sqlalchemy.orm import relationship
+from database import Base
+from datetime import datetime, timezone
+import uuid
+import enum
+
+def generate_uuid():
+    return str(uuid.uuid4())
+
+class RoleEnum(str, enum.Enum):
+    employee = "employee"
+    manager_l1 = "manager_l1"
+    manager_l2 = "manager_l2"
+    hr_admin = "hr_admin"
+
+class StatusEnum(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    escalated = "escalated"
+
+class LeaveTypeEnum(str, enum.Enum):
+    sick = "sick"
+    casual = "casual"
+    annual = "annual"
+    maternity = "maternity"
+    paternity = "paternity"
+    unpaid = "unpaid"
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    employee_id = Column(String, unique=True, nullable=False)
+    full_name = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False)
+    password = Column(String, nullable=False)
+    role = Column(String, default=RoleEnum.employee)
+    department_id = Column(String, nullable=True)
+    manager_id = Column(String, ForeignKey("users.id"), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    leave_balances = relationship("LeaveBalance", back_populates="user")
+    requests = relationship("LeaveRequest", back_populates="requester", foreign_keys="LeaveRequest.requester_id")
+
+class LeaveBalance(Base):
+    __tablename__ = "leave_balances"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)
+    total_days = Column(Float, default=0)
+    used_days = Column(Float, default=0)
+    remaining_days = Column(Float, default=0)
+    year = Column(Integer, default=lambda: datetime.now().year)
+
+    user = relationship("User", back_populates="leave_balances")
+
+class LeaveRequest(Base):
+    __tablename__ = "leave_requests"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    requester_id = Column(String, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime, nullable=False)
+    number_of_days = Column(Float, nullable=False)
+    reason = Column(String, nullable=False)
+    status = Column(String, default=StatusEnum.pending)
+    escalation_level = Column(String, default="manager_l1")
+    current_approver_id = Column(String, ForeignKey("users.id"), nullable=True)
+    comments = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True)
+    escalated_at = Column(DateTime, nullable=True)
+
+    requester = relationship("User", back_populates="requests", foreign_keys=[requester_id])
+    history = relationship("ApprovalHistory", back_populates="leave_request")
+
+class ApprovalHistory(Base):
+    __tablename__ = "approval_history"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    request_id = Column(String, ForeignKey("leave_requests.id"), nullable=False)
+    actor_id = Column(String, ForeignKey("users.id"), nullable=False)
+    action = Column(String, nullable=False)
+    comments = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    leave_request = relationship("LeaveRequest", back_populates="history")
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    workflow_id = Column(String, nullable=False, index=True)
+    workflow_type = Column(String, nullable=False, index=True)
+    event = Column(String, nullable=False)
+    actor_id = Column(String, ForeignKey("users.id"), nullable=True)
+    previous_status = Column(String, nullable=True)
+    new_status = Column(String, nullable=True)
+    details = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class NotificationLog(Base):
+    __tablename__ = "notification_logs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    workflow_id = Column(String, nullable=False, index=True)
+    workflow_type = Column(String, nullable=False)
+    event = Column(String, nullable=False)
+    recipient = Column(String, nullable=False)
+    subject = Column(String, nullable=False)
+    body = Column(String, nullable=False)
+    status = Column(String, default="queued")
+    error = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class DocumentRecord(Base):
+    __tablename__ = "documents"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    workflow_id = Column(String, nullable=False, index=True)
+    workflow_type = Column(String, nullable=False)
+    event = Column(String, nullable=False)
+    filename = Column(String, nullable=False)
+    path = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\po_models.py =====
+
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import relationship
+
+from database import Base
+from models import generate_uuid
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+class PurchaseOrder(Base):
+    __tablename__ = "purchase_orders"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    po_number = Column(String(50), unique=True, nullable=False, index=True)
+    requester_id = Column(String, ForeignKey("users.id"), nullable=False)
+    department = Column(String(100), nullable=False)
+    vendor_name = Column(String(150), nullable=False)
+    vendor_email = Column(String(150), nullable=True)
+    vendor_phone = Column(String(30), nullable=True)
+    purpose = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    total_amount = Column(Float, nullable=False, default=0.0)
+    status = Column(String(50), nullable=False, default="DRAFT")
+    approver_id = Column(String, ForeignKey("users.id"), nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    submitted_at = Column(DateTime, nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+
+    requester = relationship("User", foreign_keys=[requester_id])
+    approver = relationship("User", foreign_keys=[approver_id])
+    items = relationship(
+        "PurchaseOrderItem",
+        back_populates="purchase_order",
+        cascade="all, delete-orphan",
+    )
+
+
+class PurchaseOrderItem(Base):
+    __tablename__ = "purchase_order_items"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    purchase_order_id = Column(String, ForeignKey("purchase_orders.id"), nullable=False)
+    item_name = Column(String(200), nullable=False)
+    item_description = Column(Text, nullable=True)
+    quantity = Column(Integer, nullable=False)
+    unit_price = Column(Float, nullable=False)
+    total_price = Column(Float, nullable=False)
+
+    purchase_order = relationship("PurchaseOrder", back_populates="items")
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\po_schemas.py =====
+
+from datetime import datetime
+from typing import List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PurchaseOrderItemCreate(BaseModel):
+    item_name: str = Field(..., min_length=1, max_length=200)
+    item_description: Optional[str] = None
+    quantity: int = Field(..., gt=0)
+    unit_price: float = Field(..., gt=0)
+
+
+class PurchaseOrderItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    item_name: str
+    item_description: Optional[str] = None
+    quantity: int
+    unit_price: float
+    total_price: float
+
+
+class PurchaseOrderCreate(BaseModel):
+    department: str = Field(..., min_length=1, max_length=100)
+    vendor_name: str = Field(..., min_length=1, max_length=150)
+    vendor_email: Optional[str] = None
+    vendor_phone: Optional[str] = None
+    purpose: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    items: List[PurchaseOrderItemCreate] = Field(..., min_length=1)
+
+
+class PurchaseOrderUpdate(BaseModel):
+    department: Optional[str] = None
+    vendor_name: Optional[str] = None
+    vendor_email: Optional[str] = None
+    vendor_phone: Optional[str] = None
+    purpose: Optional[str] = None
+    description: Optional[str] = None
+    items: Optional[List[PurchaseOrderItemCreate]] = None
+
+
+class PurchaseOrderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    po_number: str
+    requester_id: str
+    department: str
+    vendor_name: str
+    vendor_email: Optional[str] = None
+    vendor_phone: Optional[str] = None
+    purpose: str
+    description: Optional[str] = None
+    total_amount: float
+    status: str
+    approver_id: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
+    approved_at: Optional[datetime] = None
+    rejected_at: Optional[datetime] = None
+    items: List[PurchaseOrderItemResponse] = []
+
+
+class PurchaseOrderApproval(BaseModel):
+    remarks: Optional[str] = None
+
+
+class PurchaseOrderRejection(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\requirements.txt =====
+
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0.41
+pydantic>=2.12
+pydantic-settings
+python-jose[cryptography]
+passlib==1.7.4
+bcrypt==4.0.1
+python-multipart
+email-validator
+httpx
+reportlab
+celery
+redis
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\schemas.py =====
+
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+class UserCreate(BaseModel):
+    employee_id: str
+    full_name: str
+    email: str
+    password: str
+    role: str
+    department_id: Optional[str] = None
+    manager_id: Optional[str] = None
+
+class UserResponse(BaseModel):
+    id: str
+    employee_id: str
+    full_name: str
+    email: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+class LeaveRequestCreate(BaseModel):
+    leave_type: str  # sick, casual, annual, maternity, paternity, unpaid
+    start_date: datetime
+    end_date: datetime
+    reason: str
+
+class LeaveRequestResponse(BaseModel):
+    id: str
+    requester_id: str
+    leave_type: str
+    start_date: datetime
+    end_date: datetime
+    number_of_days: float
+    reason: str
+    status: str
+    escalation_level: str
+    current_approver_id: Optional[str]
+    comments: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+class ApprovalAction(BaseModel):
+    action: str  # approve or reject
+    comments: Optional[str] = None
+
+class LeaveBalanceResponse(BaseModel):
+    id: str
+    user_id: str
+    leave_type: str
+    total_days: float
+    used_days: float
+    remaining_days: float
+    year: int
+
+    class Config:
+        from_attributes = True
+        # Add this line at the bottom of schemas.py
+Token = TokenResponse
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\frontend\app.js =====
+
+// ================= LOGIN & SESSION =================
+let token = localStorage.getItem("token");
+
+// Reads the user's id and role from the login token
+function getUser() {
+  if (!token) return null;
+  try {
+    const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const payload = JSON.parse(atob(part));
+    if (payload.exp && payload.exp * 1000 < Date.now()) return null; // expired
+    return payload; // { sub: user id, role: "employee" / "manager" / "admin" }
+  } catch { return null; }
+}
+
+// Sends a request to the backend with the login token attached
+async function api(path, method = "GET", body = null) {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+    body: body ? JSON.stringify(body) : null,
+  });
+  if (res.status === 401) { logout(); throw new Error("Session expired. Please log in again."); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(errorText(data) || "Error " + res.status);
+  return data;
+}
+
+function errorText(data) {
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.loc.slice(-1)[0] + ": " + d.msg).join(", ");
+  return "";
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+document.getElementById("login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const err = document.getElementById("login-error");
+  err.textContent = "";
+  const email = document.getElementById("login-email").value;
+  const form = new URLSearchParams();
+  form.append("username", email);
+  form.append("password", document.getElementById("login-password").value);
+  try {
+    const res = await fetch("/auth/token", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(errorText(data) || "Login failed");
+    token = data.access_token;
+    localStorage.setItem("token", token);
+    localStorage.setItem("email", email);
+    start();
+  } catch (ex) { err.textContent = ex.message; }
+});
+
+function logout() {
+  token = null;
+  localStorage.removeItem("token");
+  localStorage.removeItem("email");
+  document.getElementById("app-view").classList.add("hidden");
+  document.getElementById("login-view").classList.remove("hidden");
+}
+
+function start() {
+  const user = getUser();
+  if (!user) { logout(); return; }
+  document.getElementById("login-view").classList.add("hidden");
+  document.getElementById("app-view").classList.remove("hidden");
+  document.getElementById("user-info").textContent =
+    (localStorage.getItem("email") || "") + " · " + user.role;
+  showPage("home");
+}
+
+function showPage(name) {
+  document.querySelectorAll(".page").forEach(p => p.classList.add("hidden"));
+  document.getElementById("page-" + name).classList.remove("hidden");
+  if (name === "po") loadPOs();
+}
+
+// ================= PURCHASE ORDERS =================
+function addItemRow() {
+  const row = document.createElement("div");
+  row.className = "item-row";
+  row.innerHTML = `
+    <input class="i-name" placeholder="Item name" required>
+    <input class="i-desc" placeholder="Item description">
+    <input class="i-qty" type="number" min="1" value="1" placeholder="Qty" required>
+    <input class="i-price" type="number" min="0" step="0.01" placeholder="Unit price" required>
+    <button type="button" class="btn small" onclick="this.parentElement.remove(); updateTotal()">✕</button>`;
+  row.querySelectorAll("input").forEach(i => i.addEventListener("input", updateTotal));
+  document.getElementById("po-items").appendChild(row);
+}
+
+function updateTotal() {
+  let total = 0;
+  document.querySelectorAll(".item-row").forEach(r => {
+    total += (+r.querySelector(".i-qty").value || 0) * (+r.querySelector(".i-price").value || 0);
+  });
+  document.getElementById("po-total").textContent = total.toFixed(2);
+}
+
+// Remembers POs this user created (employees can't list all POs)
+function myPOKey() { return "my_pos_" + getUser().sub; }
+function rememberPO(id) {
+  const ids = JSON.parse(localStorage.getItem(myPOKey()) || "[]");
+  if (!ids.includes(id)) ids.unshift(id);
+  localStorage.setItem(myPOKey(), JSON.stringify(ids));
+}
+
+document.getElementById("po-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const msg = document.getElementById("po-msg");
+  const items = [...document.querySelectorAll(".item-row")].map(r => ({
+    item_name: r.querySelector(".i-name").value,
+    item_description: r.querySelector(".i-desc").value,
+    quantity: +r.querySelector(".i-qty").value,
+    unit_price: +r.querySelector(".i-price").value,
+  }));
+  if (!items.length) { msg.textContent = "Add at least one item."; return; }
+  try {
+    const po = await api("/purchase-orders/", "POST", {
+      department: f.department.value,
+      vendor_name: f.vendor_name.value,
+      vendor_email: f.vendor_email.value,
+      vendor_phone: f.vendor_phone.value,
+      purpose: f.purpose.value,
+      description: f.description.value,
+      items,
+    });
+    rememberPO(po.id);
+    msg.textContent = `Saved ${po.po_number} as a draft. Click "Submit" in the list below to send it for approval.`;
+    f.reset();
+    document.getElementById("po-items").innerHTML = "";
+    addItemRow();
+    updateTotal();
+    loadPOs();
+  } catch (ex) { msg.textContent = ex.message; }
+});
+
+async function loadPOs() {
+  const list = document.getElementById("po-list");
+  const user = getUser();
+  list.innerHTML = '<p class="muted">Loading...</p>';
+  let pos;
+  try {
+    pos = await api("/purchase-orders/");               // managers / admins
+  } catch {
+    const ids = JSON.parse(localStorage.getItem(myPOKey()) || "[]"); // employees
+    pos = (await Promise.all(ids.map(id => api("/purchase-orders/" + id).catch(() => null))))
+      .filter(Boolean);
+  }
+  if (!pos.length) { list.innerHTML = '<p class="muted">No purchase orders yet.</p>'; return; }
+
+  list.innerHTML = pos.map(po => {
+    const canSubmit = po.status === "DRAFT" && po.requester_id === user.sub;
+    const canApprove = po.status === "PENDING_APPROVAL" &&
+      (po.approver_id === user.sub || user.role === "admin");
+    return `
+      <div class="po-row">
+        <div>
+          <b>${esc(po.po_number)}</b> · ${esc(po.vendor_name)} · ₹${po.total_amount}
+          <div class="muted">${esc(po.purpose)} · ${new Date(po.created_at).toLocaleDateString()}</div>
+          ${po.rejection_reason ? `<div class="error">Reason: ${esc(po.rejection_reason)}</div>` : ""}
+        </div>
+        <div class="actions">
+          <span class="badge ${po.status}">${po.status.replace(/_/g, " ")}</span>
+          ${canSubmit ? `<button class="btn primary small" onclick="poAction('${po.id}','submit')">Submit</button>` : ""}
+          ${canApprove ? `
+            <button class="btn approve small" onclick="poAction('${po.id}','approve')">Approve</button>
+            <button class="btn reject small" onclick="poAction('${po.id}','reject')">Reject</button>` : ""}
+        </div>
+      </div>`;
+  }).join("");
+}
+
+async function poAction(id, action) {
+  let body = {};
+  if (action === "reject") {
+    const reason = prompt("Reason for rejection:");
+    if (!reason) return;
+    body = { reason: reason, rejection_reason: reason };
+  }
+  try {
+    await api(`/purchase-orders/${id}/${action}`, "POST", body);
+    loadPOs();
+  } catch (ex) { alert(ex.message); }
+}
+
+// ================= START =================
+addItemRow();
+if (getUser()) start();
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\frontend\index.html =====
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Automated Approval Escalation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ========== LOGIN PAGE ========== -->
+<div id="login-view">
+  <div class="login-card">
+    <h1>Automated Approval Escalation</h1>
+    <p class="muted">Sign in to continue</p>
+    <form id="login-form">
+      <label>Email</label>
+      <input type="email" id="login-email" required>
+      <label>Password</label>
+      <input type="password" id="login-password" required>
+      <button type="submit" class="btn primary full">Sign in</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+</div>
+
+<!-- ========== APP (after login) ========== -->
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <span class="brand" onclick="showPage('home')">ERP</span>
+    <span id="user-info" class="muted"></span>
+    <button class="btn small" onclick="logout()">Log out</button>
+  </header>
+
+  <main>
+    <!-- HOME: 3 options -->
+    <section id="page-home" class="page">
+      <h2>What would you like to do?</h2>
+      <div class="cards">
+        <div class="card" onclick="showPage('leave')">
+          <div class="icon">🗓️</div>
+          <h3>Leave Requests</h3>
+          <p>Apply for leave and track approvals</p>
+        </div>
+        <div class="card" onclick="showPage('po')">
+          <div class="icon">🧾</div>
+          <h3>Purchase Orders</h3>
+          <p>Create, submit and approve purchase orders</p>
+        </div>
+        <div class="card" onclick="showPage('erp')">
+          <div class="icon">🏫</div>
+          <h3>ERP</h3>
+          <p>University records and administration</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- PURCHASE ORDERS -->
+    <section id="page-po" class="page hidden">
+      <button class="link" onclick="showPage('home')">← Back to home</button>
+      <h2>Purchase Orders</h2>
+
+      <div class="box">
+        <h3>New purchase order</h3>
+        <form id="po-form">
+          <div class="grid">
+            <input name="department" placeholder="Department" required>
+            <input name="vendor_name" placeholder="Vendor name" required>
+            <input name="vendor_email" placeholder="Vendor email">
+            <input name="vendor_phone" placeholder="Vendor phone">
+          </div>
+          <input name="purpose" placeholder="Purpose" required>
+          <textarea name="description" placeholder="Description"></textarea>
+
+          <h4>Items</h4>
+          <div id="po-items"></div>
+          <button type="button" class="btn small" onclick="addItemRow()">+ Add item</button>
+          <p>Total: <b>₹<span id="po-total">0.00</span></b></p>
+
+          <button type="submit" class="btn primary">Save as draft</button>
+          <p id="po-msg" class="muted"></p>
+        </form>
+      </div>
+
+      <div class="box">
+        <h3>Purchase orders</h3>
+        <div id="po-list"></div>
+      </div>
+    </section>
+
+    <!-- LEAVE REQUESTS (connected in next step) -->
+    <section id="page-leave" class="page hidden">
+      <button class="link" onclick="showPage('home')">← Back to home</button>
+      <h2>Leave Requests</h2>
+      <div class="box muted">This section will be connected in the next step.</div>
+    </section>
+
+    <!-- ERP (connected in next step) -->
+    <section id="page-erp" class="page hidden">
+      <button class="link" onclick="showPage('home')">← Back to home</button>
+      <h2>Automated Approval Escalation</h2>
+      <div class="box muted">This section will be connected in the next step.</div>
+    </section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\frontend\style.css =====
+
+* { box-sizing: border-box; }
+body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; background: #f3f5f9; color: #1f2937; }
+.hidden { display: none !important; }
+.muted { color: #6b7280; font-size: 14px; }
+.error { color: #dc2626; font-size: 14px; }
+
+/* Login */
+#login-view { min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #1e3a8a, #3b82f6); }
+.login-card { background: #fff; padding: 36px; border-radius: 14px; width: 360px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+.login-card h1 { margin: 0 0 4px; }
+label { display: block; margin: 14px 0 4px; font-size: 14px; font-weight: 600; }
+input, textarea { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px;
+  font-size: 14px; font-family: inherit; }
+textarea { margin-top: 10px; min-height: 70px; }
+
+/* Buttons */
+.btn { padding: 9px 16px; border: 1px solid #d1d5db; background: #fff; border-radius: 8px;
+  cursor: pointer; font-size: 14px; }
+.btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.btn.approve { background: #16a34a; border-color: #16a34a; color: #fff; }
+.btn.reject  { background: #dc2626; border-color: #dc2626; color: #fff; }
+.btn.small { padding: 5px 12px; font-size: 13px; }
+.btn.full { width: 100%; margin-top: 20px; }
+.link { background: none; border: none; color: #2563eb; cursor: pointer; padding: 0; font-size: 14px; }
+
+/* Top bar */
+.topbar { display: flex; align-items: center; gap: 16px; padding: 14px 28px; background: #1e3a8a; color: #fff; }
+.topbar .brand { font-weight: 700; font-size: 18px; cursor: pointer; margin-right: auto; }
+.topbar .muted { color: #c7d2fe; }
+main { max-width: 1000px; margin: 30px auto; padding: 0 20px; }
+
+/* Home cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
+.card { background: #fff; padding: 28px; border-radius: 14px; cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,.06); transition: .2s; }
+.card:hover { transform: translateY(-4px); box-shadow: 0 8px 20px rgba(0,0,0,.12); }
+.card .icon { font-size: 36px; }
+.card h3 { margin: 10px 0 6px; }
+.card p { margin: 0; color: #6b7280; font-size: 14px; }
+
+/* Sections */
+.box { background: #fff; padding: 22px; border-radius: 12px; margin-top: 20px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.item-row { display: grid; grid-template-columns: 2fr 2fr 1fr 1fr auto; gap: 8px; margin-bottom: 8px; }
+.po-row { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 14px 0; border-bottom: 1px solid #eee; }
+.actions { display: flex; gap: 8px; align-items: center; }
+.badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; background: #e5e7eb; }
+.badge.PENDING_APPROVAL { background: #fef3c7; color: #92400e; }
+.badge.APPROVED { background: #dcfce7; color: #166534; }
+.badge.REJECTED { background: #fee2e2; color: #991b1b; }
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\admin.py =====
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import User
+from po_models import PurchaseOrder
+from routers.users import require_role
+from schemas import UserResponse
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+admin_only = require_role("hr_admin")
+MANAGER_ROLES = ("manager_l1", "manager_l2", "hr_admin")
+PO_STATUSES = ("DRAFT", "PENDING_APPROVAL", "APPROVED", "REJECTED", "CANCELLED")
+
+
+class ManagerAssignment(BaseModel):
+    manager_id: Optional[str] = None
+
+
+def _get_user(db: Session, user_id: str) -> User:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return user
+
+
+@router.put("/users/{user_id}/activate", response_model=UserResponse)
+def activate_user(user_id: str, db: Session = Depends(get_db), current_user: User = Depends(admin_only)):
+    user = _get_user(db, user_id)
+    user.is_active = True
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.put("/users/{user_id}/deactivate", response_model=UserResponse)
+def deactivate_user(user_id: str, db: Session = Depends(get_db), current_user: User = Depends(admin_only)):
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account.")
+    user = _get_user(db, user_id)
+    user.is_active = False
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.put("/users/{user_id}/manager", response_model=UserResponse)
+def assign_manager(user_id: str, data: ManagerAssignment, db: Session = Depends(get_db),
+                   current_user: User = Depends(admin_only)):
+    """Set (or clear, with null) a user's manager."""
+    user = _get_user(db, user_id)
+    if data.manager_id:
+        if data.manager_id == user.id:
+            raise HTTPException(status_code=400, detail="A user cannot be their own manager.")
+        manager = _get_user(db, data.manager_id)
+        if manager.role not in MANAGER_ROLES:
+            raise HTTPException(status_code=400, detail="That user is not a manager.")
+    user.manager_id = data.manager_id
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.get("/purchase-orders/summary")
+def purchase_order_summary(db: Session = Depends(get_db), current_user: User = Depends(admin_only)):
+    counts = {s: 0 for s in PO_STATUSES}
+    rows = db.query(PurchaseOrder.status, func.count(PurchaseOrder.id)).group_by(PurchaseOrder.status).all()
+    for status_value, count in rows:
+        counts[status_value] = count
+    return {"total": sum(counts.values()), **{k.lower(): v for k, v in counts.items()}}
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\auth.py =====
+
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
+from jose import jwt
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from config import settings
+from database import get_db
+from models import RoleEnum, User
+from schemas import LoginRequest, TokenResponse, UserCreate, UserResponse
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+VALID_ROLES = [role.value for role in RoleEnum]
+MANAGER_ROLES = ("manager_l1", "manager_l2", "hr_admin")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def authenticate(db: Session, email: str, password: str) -> User:
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    return user
+
+
+@router.post("/register", response_model=UserResponse)
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    if user.role not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(VALID_ROLES)}")
+
+    if db.query(User).filter(User.email == user.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    if db.query(User).filter(User.employee_id == user.employee_id).first():
+        raise HTTPException(status_code=400, detail="Employee ID already registered")
+
+    if user.manager_id:
+        manager = db.query(User).filter(User.id == user.manager_id).first()
+        if not manager or manager.role not in MANAGER_ROLES:
+            raise HTTPException(status_code=400, detail="manager_id must be the id of an existing manager")
+
+    new_user = User(
+        employee_id=user.employee_id,
+        full_name=user.full_name,
+        email=user.email,
+        password=hash_password(user.password),
+        role=user.role,
+        department_id=user.department_id,
+        manager_id=user.manager_id,
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(request: LoginRequest, db: Session = Depends(get_db)):
+    """JSON login used by the React frontend."""
+    user = authenticate(db, request.email, request.password)
+    token = create_token({"sub": str(user.id), "role": user.role})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/token", response_model=TokenResponse)
+def token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Form login used by the Authorize button on /docs (username = email)."""
+    user = authenticate(db, form_data.username, form_data.password)
+    access_token = create_token({"sub": str(user.id), "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\leave_balance.py =====
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from database import get_db
+from models import LeaveBalance, User
+from schemas import LeaveBalanceResponse
+from routers.users import get_current_user
+from typing import List
+from datetime import datetime
+
+router = APIRouter(prefix="/leave-balance", tags=["leave-balance"])
+
+@router.get("/", response_model=List[LeaveBalanceResponse])
+def get_my_leave_balance(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    balances = db.query(LeaveBalance).filter(
+        LeaveBalance.user_id == current_user.id,
+        LeaveBalance.year == datetime.now().year
+    ).all()
+    return balances
+
+@router.post("/initialize")
+def initialize_leave_balance(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    leave_types = {
+        "sick": 10,
+        "casual": 10,
+        "annual": 20,
+        "maternity": 90,
+        "paternity": 15,
+        "unpaid": 30
+    }
+
+    created = []
+    for leave_type, days in leave_types.items():
+        existing = db.query(LeaveBalance).filter(
+            LeaveBalance.user_id == current_user.id,
+            LeaveBalance.leave_type == leave_type,
+            LeaveBalance.year == datetime.now().year
+        ).first()
+
+        if not existing:
+            balance = LeaveBalance(
+                user_id=current_user.id,
+                leave_type=leave_type,
+                total_days=days,
+                used_days=0,
+                remaining_days=days,
+                year=datetime.now().year
+            )
+            db.add(balance)
+            created.append(leave_type)
+
+    db.commit()
+    return {"message": "Leave balance initialized", "types": created}
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\outflows.py =====
+
+from pathlib import Path
+from typing import Any, Dict, Optional
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+from database import get_db
+from models import AuditLog, NotificationLog, DocumentRecord
+from routers.users import get_current_user
+from models import User
+from services.outflow_service import process_event
+
+router = APIRouter(prefix="/outflows", tags=["common outflows"])
+
+class WorkflowEvent(BaseModel):
+    workflow_id: str
+    workflow_type: str
+    event: str
+    actor_id: Optional[str] = None
+    recipient_email: Optional[str] = None
+    notification_subject: Optional[str] = None
+    notification_body: Optional[str] = None
+    previous_status: Optional[str] = None
+    new_status: Optional[str] = None
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+@router.post("/events")
+def create_workflow_event(payload: WorkflowEvent, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    actor = payload.actor_id or current_user.id
+    audit, notification, document = process_event(
+        db, workflow_id=payload.workflow_id, workflow_type=payload.workflow_type,
+        event=payload.event.upper(), actor_id=actor,
+        recipient_email=payload.recipient_email,
+        notification_subject=payload.notification_subject,
+        notification_body=payload.notification_body,
+        data=payload.data, previous_status=payload.previous_status,
+        new_status=payload.new_status)
+    db.commit()
+    return {"event": payload.event.upper(), "workflow_id": payload.workflow_id,
+            "audit_id": audit.id, "notification_id": notification.id if notification else None,
+            "document_id": document.id if document else None}
+
+@router.get("/audit/{workflow_id}")
+def get_audit(workflow_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return db.query(AuditLog).filter(AuditLog.workflow_id == workflow_id).order_by(AuditLog.created_at.desc()).all()
+
+@router.get("/audit/{workflow_id}/report")
+def audit_report(workflow_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    rows = db.query(AuditLog).filter(AuditLog.workflow_id == workflow_id).order_by(AuditLog.created_at.asc()).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="No audit records found")
+    out_dir = Path("generated_documents"); out_dir.mkdir(exist_ok=True)
+    safe_id = "".join(c for c in workflow_id if c.isalnum() or c in "-_") or "workflow"
+    path = out_dir / f"{safe_id}_audit_report.pdf"
+    c = canvas.Canvas(str(path), pagesize=A4); width, height = A4
+    y = height - 55
+    c.setFont("Helvetica-Bold", 17); c.drawString(45, y, "Workflow Audit Report")
+    y -= 25; c.setFont("Helvetica", 10); c.drawString(45, y, f"Workflow ID: {workflow_id}")
+    y -= 30
+    for row in rows:
+        lines = [f"Event: {row.event}", f"Workflow Type: {row.workflow_type}", f"Actor: {row.actor_id or 'system'}", f"Status: {row.previous_status or '-'} -> {row.new_status or '-'}", f"Time: {row.created_at}", f"Details: {row.details or '{}'}"]
+        for line in lines:
+            if y < 60:
+                c.showPage(); y = height - 55; c.setFont("Helvetica", 10)
+            for chunk in [line[i:i+100] for i in range(0, len(line), 100)]:
+                c.drawString(50, y, chunk); y -= 14
+        y -= 8
+    c.save()
+    return FileResponse(path, media_type="application/pdf", filename=path.name)
+
+@router.get("/notifications/{workflow_id}")
+def get_notifications(workflow_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return db.query(NotificationLog).filter(NotificationLog.workflow_id == workflow_id).order_by(NotificationLog.created_at.desc()).all()
+
+@router.get("/documents/{document_id}")
+def get_document(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    doc = db.query(DocumentRecord).filter(DocumentRecord.id == document_id).first()
+    if not doc: raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+@router.get("/documents/{document_id}/download")
+def download_document(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    doc = db.query(DocumentRecord).filter(DocumentRecord.id == document_id).first()
+    if not doc: raise HTTPException(status_code=404, detail="Document not found")
+    path = Path(doc.path)
+    if not path.exists(): raise HTTPException(status_code=404, detail="Generated file not found")
+    return FileResponse(path, media_type="application/pdf", filename=doc.filename)
+
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\purchase_orders.py =====
+
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import DocumentRecord, User
+from po_schemas import (
+    PurchaseOrderApproval,
+    PurchaseOrderCreate,
+    PurchaseOrderRejection,
+    PurchaseOrderResponse,
+    PurchaseOrderUpdate,
+)
+from routers.users import get_current_user, require_role
+from services import po_service
+
+router = APIRouter(prefix="/purchase-orders", tags=["purchase orders"])
+
+
+def _handle(db: Session, action):
+    """Turn service errors into clear HTTP errors."""
+    try:
+        return action()
+    except PermissionError as exc:
+        db.rollback()
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _get_po(db: Session, po_id: str):
+    po = po_service.get_purchase_order(db, po_id)
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase Order not found.")
+    return po
+
+
+def _get_visible_po(db: Session, po_id: str, user: User):
+    po = _get_po(db, po_id)
+    if not po_service.can_view(po, user):
+        raise HTTPException(status_code=403, detail="You do not have permission to view this Purchase Order.")
+    return po
+
+
+@router.post("/", response_model=PurchaseOrderResponse, status_code=status.HTTP_201_CREATED)
+def create_po(data: PurchaseOrderCreate, db: Session = Depends(get_db),
+              current_user: User = Depends(get_current_user)):
+    """Create a Purchase Order in DRAFT status."""
+    return _handle(db, lambda: po_service.create_purchase_order(db, current_user, data))
+
+
+@router.get("/my", response_model=List[PurchaseOrderResponse])
+def my_pos(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Purchase Orders created by the logged-in user."""
+    return po_service.list_purchase_orders(db, requester_id=current_user.id)
+
+
+@router.get("/", response_model=List[PurchaseOrderResponse])
+def list_pos(status_filter: Optional[str] = None, db: Session = Depends(get_db),
+             current_user: User = Depends(require_role(*po_service.APPROVER_ROLES))):
+    """For approvers. manager_l1 sees POs assigned to them, manager_l2 and hr_admin see all."""
+    status_value = status_filter.upper() if status_filter else None
+    if current_user.role == "manager_l1":
+        return po_service.list_purchase_orders(db, approver_id=current_user.id, status=status_value)
+    return po_service.list_purchase_orders(db, status=status_value)
+
+
+@router.get("/{po_id}", response_model=PurchaseOrderResponse)
+def get_po(po_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return _get_visible_po(db, po_id, current_user)
+
+
+@router.put("/{po_id}", response_model=PurchaseOrderResponse)
+def update_po(po_id: str, data: PurchaseOrderUpdate, db: Session = Depends(get_db),
+              current_user: User = Depends(get_current_user)):
+    """Edit a DRAFT or REJECTED Purchase Order."""
+    po = _get_po(db, po_id)
+    return _handle(db, lambda: po_service.update_purchase_order(db, po, current_user, data))
+
+
+@router.post("/{po_id}/submit", response_model=PurchaseOrderResponse)
+def submit_po(po_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    po = _get_po(db, po_id)
+    return _handle(db, lambda: po_service.submit_purchase_order(db, po, current_user))
+
+
+@router.post("/{po_id}/approve", response_model=PurchaseOrderResponse)
+def approve_po(po_id: str, data: PurchaseOrderApproval, db: Session = Depends(get_db),
+               current_user: User = Depends(get_current_user)):
+    po = _get_po(db, po_id)
+    return _handle(db, lambda: po_service.approve_purchase_order(db, po, current_user, data.remarks))
+
+
+@router.post("/{po_id}/reject", response_model=PurchaseOrderResponse)
+def reject_po(po_id: str, data: PurchaseOrderRejection, db: Session = Depends(get_db),
+              current_user: User = Depends(get_current_user)):
+    po = _get_po(db, po_id)
+    return _handle(db, lambda: po_service.reject_purchase_order(db, po, current_user, data.reason))
+
+
+@router.post("/{po_id}/resubmit", response_model=PurchaseOrderResponse)
+def resubmit_po(po_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    po = _get_po(db, po_id)
+    return _handle(db, lambda: po_service.resubmit_purchase_order(db, po, current_user))
+
+
+@router.post("/{po_id}/cancel", response_model=PurchaseOrderResponse)
+def cancel_po(po_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    po = _get_po(db, po_id)
+    return _handle(db, lambda: po_service.cancel_purchase_order(db, po, current_user))
+
+
+@router.get("/{po_id}/status")
+def po_status(po_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    po = _get_visible_po(db, po_id, current_user)
+    return {
+        "purchase_order_id": po.id,
+        "po_number": po.po_number,
+        "status": po.status,
+        "approver_id": po.approver_id,
+        "submitted_at": po.submitted_at,
+        "approved_at": po.approved_at,
+        "rejected_at": po.rejected_at,
+        "rejection_reason": po.rejection_reason,
+    }
+
+
+@router.get("/{po_id}/document")
+def po_document(po_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Download the PDF created when the Purchase Order was approved."""
+    po = _get_visible_po(db, po_id, current_user)
+    doc = (
+        db.query(DocumentRecord)
+        .filter(DocumentRecord.workflow_id == po.id)
+        .order_by(DocumentRecord.created_at.desc())
+        .first()
+    )
+    if not doc or not Path(doc.path).exists():
+        raise HTTPException(status_code=404, detail="No document yet. A PDF is created when the PO is approved.")
+    return FileResponse(doc.path, media_type="application/pdf", filename=doc.filename)
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\requests.py =====
+
+from datetime import datetime, timedelta, timezone
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import ApprovalHistory, LeaveBalance, LeaveRequest, User
+from routers.users import get_current_user
+from schemas import ApprovalAction, LeaveRequestCreate, LeaveRequestResponse
+from services.outflow_service import process_event
+
+router = APIRouter(prefix="/requests", tags=["requests"])
+
+OPEN_STATUSES = ("pending", "escalated")
+VIEW_ALL_ROLES = ("manager_l2", "hr_admin")
+
+
+def calculate_working_days(start_date: datetime, end_date: datetime) -> float:
+    days = 0
+    current = start_date
+    while current <= end_date:
+        if current.weekday() < 5:  # Monday to Friday
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
+def find_approver(db: Session, user: User):
+    """The user's own manager, or the first active manager_l1 as a fallback."""
+    if user.manager_id:
+        manager = db.query(User).filter(User.id == user.manager_id, User.is_active == True).first()
+        if manager:
+            return manager
+    return db.query(User).filter(
+        User.role == "manager_l1", User.is_active == True, User.id != user.id
+    ).first()
+
+
+@router.post("/", response_model=LeaveRequestResponse)
+def create_leave_request(
+    data: LeaveRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if data.start_date > data.end_date:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+
+    number_of_days = calculate_working_days(data.start_date, data.end_date)
+    if number_of_days == 0:
+        raise HTTPException(status_code=400, detail="The selected dates have no working days")
+
+    balance = db.query(LeaveBalance).filter(
+        LeaveBalance.user_id == current_user.id,
+        LeaveBalance.leave_type == data.leave_type,
+        LeaveBalance.year == datetime.now().year,
+    ).first()
+    if balance and balance.remaining_days < number_of_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient leave balance. Available: {balance.remaining_days} days",
+        )
+
+    approver = find_approver(db, current_user)
+
+    new_request = LeaveRequest(
+        requester_id=current_user.id,
+        leave_type=data.leave_type,
+        start_date=data.start_date,
+        end_date=data.end_date,
+        number_of_days=number_of_days,
+        reason=data.reason,
+        current_approver_id=approver.id if approver else None,
+        status="pending",
+        escalation_level="manager_l1",
+    )
+    db.add(new_request)
+    db.commit()
+    db.refresh(new_request)
+
+    process_event(
+        db,
+        workflow_id=str(new_request.id),
+        workflow_type="leave_request",
+        event="SUBMITTED",
+        actor_id=current_user.id,
+        recipient_email=approver.email if approver else None,
+        notification_subject=f"New Leave Request: {data.leave_type}",
+        notification_body=(
+            f"<p>A new leave request needs your approval.</p>"
+            f"<p><b>Employee:</b> {current_user.full_name}</p>"
+            f"<p><b>Leave Type:</b> {data.leave_type}</p>"
+            f"<p><b>From:</b> {data.start_date.date()}</p>"
+            f"<p><b>To:</b> {data.end_date.date()}</p>"
+            f"<p><b>Days:</b> {number_of_days}</p>"
+            f"<p><b>Reason:</b> {data.reason}</p>"
+        ),
+        data={
+            "leave_type": data.leave_type,
+            "start_date": data.start_date,
+            "end_date": data.end_date,
+            "number_of_days": number_of_days,
+            "reason": data.reason,
+        },
+        previous_status=None,
+        new_status="pending",
+    )
+    db.commit()
+    return new_request
+
+
+@router.get("/", response_model=List[LeaveRequestResponse])
+def get_leave_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role == "employee":
+        return db.query(LeaveRequest).filter(LeaveRequest.requester_id == current_user.id).all()
+    if current_user.role in ("manager_l1", "manager_l2"):
+        return db.query(LeaveRequest).filter(LeaveRequest.current_approver_id == current_user.id).all()
+    return db.query(LeaveRequest).all()
+
+
+@router.get("/{request_id}", response_model=LeaveRequestResponse)
+def get_leave_request(
+    request_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    request = db.query(LeaveRequest).filter(LeaveRequest.id == request_id).first()
+    if not request:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    allowed = (
+        request.requester_id == current_user.id
+        or request.current_approver_id == current_user.id
+        or current_user.role in VIEW_ALL_ROLES
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Not authorized to view this request")
+    return request
+
+
+@router.post("/{request_id}/action")
+def action_leave_request(
+    request_id: str,
+    action: ApprovalAction,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    request = db.query(LeaveRequest).filter(LeaveRequest.id == request_id).first()
+    if not request:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    action_name = action.action.lower()
+    if action_name not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="Action must be approve or reject")
+
+    if request.status not in OPEN_STATUSES:
+        raise HTTPException(status_code=400, detail=f"This request is already {request.status}")
+
+    if str(request.current_approver_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    previous_status = request.status
+    request.status = "approved" if action_name == "approve" else "rejected"
+    request.comments = action.comments
+    request.updated_at = datetime.now(timezone.utc)
+
+    if action_name == "approve":
+        balance = db.query(LeaveBalance).filter(
+            LeaveBalance.user_id == request.requester_id,
+            LeaveBalance.leave_type == request.leave_type,
+            LeaveBalance.year == datetime.now().year,
+        ).first()
+        if balance:
+            balance.used_days += request.number_of_days
+            balance.remaining_days -= request.number_of_days
+
+    db.add(ApprovalHistory(
+        request_id=request.id,
+        actor_id=current_user.id,
+        action=action_name,
+        comments=action.comments,
+    ))
+    db.commit()
+
+    requester = db.query(User).filter(User.id == request.requester_id).first()
+    process_event(
+        db,
+        workflow_id=str(request.id),
+        workflow_type="leave_request",
+        event="APPROVED" if action_name == "approve" else "REJECTED",
+        actor_id=current_user.id,
+        recipient_email=requester.email if requester else None,
+        notification_subject=f"Your Leave Request has been {request.status}",
+        notification_body=(
+            f"<p>Your leave request has been <b>{request.status}</b>.</p>"
+            f"<p><b>Leave Type:</b> {request.leave_type}</p>"
+            f"<p><b>From:</b> {request.start_date.date()}</p>"
+            f"<p><b>To:</b> {request.end_date.date()}</p>"
+            f"<p><b>Days:</b> {request.number_of_days}</p>"
+            f"<p><b>Comments:</b> {action.comments or 'None'}</p>"
+        ),
+        data={
+            "leave_type": request.leave_type,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "number_of_days": request.number_of_days,
+            "reason": request.reason,
+            "comments": action.comments,
+        },
+        previous_status=previous_status,
+        new_status=request.status,
+    )
+    db.commit()
+
+    return {"status": request.status, "request_id": request_id}
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\users.py =====
+
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+
+from config import settings
+from database import get_db
+from models import User
+from schemas import UserResponse
+
+router = APIRouter(prefix="/users", tags=["users"])
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    return user
+
+
+def require_role(*allowed_roles: str):
+    """Use as: current_user: User = Depends(require_role("hr_admin"))"""
+    def checker(current_user: User = Depends(get_current_user)):
+        if current_user.role not in allowed_roles:
+            raise HTTPException(status_code=403, detail="You do not have permission for this action.")
+        return current_user
+    return checker
+
+
+@router.get("/me", response_model=UserResponse)
+def get_me(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+@router.get("/", response_model=List[UserResponse])
+def get_all_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("hr_admin", "manager_l2")),
+):
+    return db.query(User).filter(User.is_active == True).all()
+
+
+@router.get("/{user_id}", response_model=UserResponse)
+def get_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\routers\__init__.py =====
+
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\services\outflow_service.py =====
+
+"""Common outflow services shared by all workflow types."""
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from sqlalchemy.orm import Session
+
+from models import AuditLog, DocumentRecord, NotificationLog
+from tasks.notifications import send_email
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def log_audit(db: Session, *, workflow_id: str, workflow_type: str, event: str,
+              actor_id: Optional[str] = None, details: Optional[Dict[str, Any]] = None,
+              previous_status: Optional[str] = None, new_status: Optional[str] = None):
+    row = AuditLog(workflow_id=workflow_id, workflow_type=workflow_type, event=event,
+                   actor_id=actor_id, previous_status=previous_status,
+                   new_status=new_status, details=json.dumps(details or {}, default=str),
+                   created_at=utcnow())
+    db.add(row)
+    return row
+
+
+def queue_notification(db: Session, *, workflow_id: str, workflow_type: str,
+                       event: str, to_email: str, subject: str, body: str):
+    row = NotificationLog(workflow_id=workflow_id, workflow_type=workflow_type,
+                          event=event, recipient=to_email, subject=subject,
+                          body=body, status="queued", created_at=utcnow())
+    db.add(row)
+    db.flush()
+    row.status = send_email(to_email, subject, body)
+    return row
+
+
+def generate_completion_document(db: Session, *, workflow_id: str, workflow_type: str,
+                                 event: str, data: Dict[str, Any]):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    out_dir = Path("generated_documents")
+    out_dir.mkdir(exist_ok=True)
+    safe_id = "".join(c for c in workflow_id if c.isalnum() or c in "-_") or "workflow"
+    filename = f"{safe_id}_{event.lower()}_report.pdf"
+    path = out_dir / filename
+
+    c = canvas.Canvas(str(path), pagesize=A4)
+    width, height = A4
+    y = height - 60
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(50, y, "Workflow Completion Report")
+    y -= 35
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, f"Workflow ID: {workflow_id}")
+    y -= 18
+    c.drawString(50, y, f"Workflow Type: {workflow_type}")
+    y -= 18
+    c.drawString(50, y, f"Event: {event}")
+    y -= 18
+    c.drawString(50, y, f"Generated: {utcnow().isoformat()}")
+    y -= 30
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Workflow Data")
+    y -= 20
+    c.setFont("Helvetica", 10)
+    for key, value in data.items():
+        text = f"{key}: {value}"
+        for chunk in [text[i:i + 95] for i in range(0, len(text), 95)]:
+            if y < 55:
+                c.showPage()
+                y = height - 55
+                c.setFont("Helvetica", 10)
+            c.drawString(55, y, chunk)
+            y -= 16
+    c.save()
+
+    row = DocumentRecord(workflow_id=workflow_id, workflow_type=workflow_type,
+                         event=event, filename=filename, path=str(path),
+                         created_at=utcnow())
+    db.add(row)
+    return row
+
+
+def process_event(db: Session, *, workflow_id: str, workflow_type: str, event: str,
+                  actor_id: Optional[str] = None, recipient_email: Optional[str] = None,
+                  notification_subject: Optional[str] = None,
+                  notification_body: Optional[str] = None,
+                  data: Optional[Dict[str, Any]] = None,
+                  previous_status: Optional[str] = None,
+                  new_status: Optional[str] = None):
+    data = data or {}
+    audit = log_audit(db, workflow_id=workflow_id, workflow_type=workflow_type,
+                      event=event, actor_id=actor_id, details=data,
+                      previous_status=previous_status, new_status=new_status)
+
+    notification = None
+    if recipient_email and notification_subject and notification_body:
+        notification = queue_notification(db, workflow_id=workflow_id,
+                                          workflow_type=workflow_type, event=event,
+                                          to_email=recipient_email,
+                                          subject=notification_subject,
+                                          body=notification_body)
+
+    document = None
+    if event.upper() == "COMPLETED":
+        document = generate_completion_document(db, workflow_id=workflow_id,
+                                                workflow_type=workflow_type,
+                                                event=event, data=data)
+    return audit, notification, document
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\services\po_service.py =====
+
+"""Purchase order logic and approval workflow."""
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from sqlalchemy.orm import Session
+
+from models import User
+from po_models import PurchaseOrder, PurchaseOrderItem
+from services.outflow_service import process_event
+
+WORKFLOW_TYPE = "purchase_order"
+APPROVER_ROLES = ("manager_l1", "manager_l2", "hr_admin")
+VIEW_ALL_ROLES = ("manager_l2", "hr_admin")
+EDITABLE_STATUSES = ("DRAFT", "REJECTED")
+CANCELLABLE_STATUSES = ("DRAFT", "PENDING_APPROVAL")
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def generate_po_number() -> str:
+    return f"PO-{datetime.now().year}-{uuid4().hex[:8].upper()}"
+
+
+def _build_items(items_data):
+    items, total = [], 0.0
+    for d in items_data:
+        line_total = round(d.quantity * d.unit_price, 2)
+        items.append(PurchaseOrderItem(
+            item_name=d.item_name,
+            item_description=d.item_description,
+            quantity=d.quantity,
+            unit_price=d.unit_price,
+            total_price=line_total,
+        ))
+        total += line_total
+    return items, round(total, 2)
+
+
+def find_approver(db: Session, user: User):
+    """The user's own manager, otherwise the first available approver."""
+    if user.manager_id:
+        manager = db.query(User).filter(User.id == user.manager_id, User.is_active == True).first()
+        if manager and manager.role in APPROVER_ROLES and manager.id != user.id:
+            return manager
+    for role in APPROVER_ROLES:
+        approver = db.query(User).filter(
+            User.role == role, User.is_active == True, User.id != user.id
+        ).first()
+        if approver:
+            return approver
+    return None
+
+
+def can_view(po: PurchaseOrder, user: User) -> bool:
+    return (
+        po.requester_id == user.id
+        or po.approver_id == user.id
+        or user.role in VIEW_ALL_ROLES
+    )
+
+
+def can_decide(po: PurchaseOrder, user: User) -> bool:
+    if po.requester_id == user.id:
+        return False
+    if user.role in VIEW_ALL_ROLES:
+        return True
+    return user.role in APPROVER_ROLES and po.approver_id == user.id
+
+
+def _po_html(po: PurchaseOrder, heading: str) -> str:
+    return (
+        f"<p>{heading}</p>"
+        f"<p><b>PO Number:</b> {po.po_number}</p>"
+        f"<p><b>Department:</b> {po.department}</p>"
+        f"<p><b>Vendor:</b> {po.vendor_name}</p>"
+        f"<p><b>Purpose:</b> {po.purpose}</p>"
+        f"<p><b>Total:</b> {po.total_amount}</p>"
+    )
+
+
+def _record(db: Session, po: PurchaseOrder, event: str, actor_id: str,
+            old_status, new_status, recipient=None, subject=None, body=None, extra=None):
+    data = {
+        "po_number": po.po_number,
+        "department": po.department,
+        "vendor_name": po.vendor_name,
+        "purpose": po.purpose,
+        "total_amount": po.total_amount,
+        "items": [f"{i.item_name} x{i.quantity} @ {i.unit_price}" for i in po.items],
+    }
+    if extra:
+        data.update(extra)
+    process_event(
+        db,
+        workflow_id=str(po.id),
+        workflow_type=WORKFLOW_TYPE,
+        event=event,
+        actor_id=actor_id,
+        recipient_email=recipient,
+        notification_subject=subject if recipient else None,
+        notification_body=body if recipient else None,
+        data=data,
+        previous_status=old_status,
+        new_status=new_status,
+    )
+
+
+# ---------------- CRUD ----------------
+
+def create_purchase_order(db: Session, user: User, data):
+    items, total = _build_items(data.items)
+    po = PurchaseOrder(
+        po_number=generate_po_number(),
+        requester_id=user.id,
+        department=data.department,
+        vendor_name=data.vendor_name,
+        vendor_email=data.vendor_email,
+        vendor_phone=data.vendor_phone,
+        purpose=data.purpose,
+        description=data.description,
+        status="DRAFT",
+        total_amount=total,
+        items=items,
+    )
+    db.add(po)
+    db.flush()
+    _record(db, po, "CREATED", user.id, None, "DRAFT")
+    db.commit()
+    db.refresh(po)
+    return po
+
+
+def get_purchase_order(db: Session, po_id: str):
+    return db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+
+
+def list_purchase_orders(db: Session, *, requester_id=None, approver_id=None, status=None):
+    query = db.query(PurchaseOrder)
+    if requester_id:
+        query = query.filter(PurchaseOrder.requester_id == requester_id)
+    if approver_id:
+        query = query.filter(PurchaseOrder.approver_id == approver_id)
+    if status:
+        query = query.filter(PurchaseOrder.status == status)
+    return query.order_by(PurchaseOrder.created_at.desc()).all()
+
+
+def update_purchase_order(db: Session, po: PurchaseOrder, user: User, data):
+    if po.status not in EDITABLE_STATUSES:
+        raise ValueError("Only DRAFT or REJECTED Purchase Orders can be edited.")
+    if po.requester_id != user.id and user.role != "hr_admin":
+        raise PermissionError("You can only edit your own Purchase Order.")
+
+    for field in ("department", "vendor_name", "vendor_email", "vendor_phone", "purpose", "description"):
+        value = getattr(data, field)
+        if value is not None:
+            setattr(po, field, value)
+
+    if data.items is not None:
+        if not data.items:
+            raise ValueError("A Purchase Order needs at least one item.")
+        items, total = _build_items(data.items)
+        po.items.clear()
+        po.items.extend(items)
+        po.total_amount = total
+
+    po.updated_at = utcnow()
+    db.commit()
+    db.refresh(po)
+    return po
+
+
+# ---------------- Workflow ----------------
+
+def submit_purchase_order(db: Session, po: PurchaseOrder, user: User):
+    if po.status != "DRAFT":
+        raise ValueError("Only DRAFT Purchase Orders can be submitted.")
+    if po.requester_id != user.id:
+        raise PermissionError("You can only submit your own Purchase Order.")
+    if not po.items or po.total_amount <= 0:
+        raise ValueError("Purchase Order must have at least one item and a total above zero.")
+
+    approver = find_approver(db, user)
+    if not approver:
+        raise ValueError("No approver available. Register a manager_l1 user first.")
+
+    old = po.status
+    po.status = "PENDING_APPROVAL"
+    po.approver_id = approver.id
+    po.submitted_at = utcnow()
+    po.updated_at = utcnow()
+
+    _record(db, po, "SUBMITTED", user.id, old, po.status,
+            recipient=approver.email,
+            subject=f"Purchase Order {po.po_number} needs your approval",
+            body=_po_html(po, f"A Purchase Order from {user.full_name} needs your approval."))
+    db.commit()
+    db.refresh(po)
+    return po
+
+
+def approve_purchase_order(db: Session, po: PurchaseOrder, user: User, remarks=None):
+    if po.status != "PENDING_APPROVAL":
+        raise ValueError("Only Purchase Orders pending approval can be approved.")
+    if not can_decide(po, user):
+        raise PermissionError("You are not allowed to approve this Purchase Order.")
+
+    old = po.status
+    po.status = "APPROVED"
+    po.approver_id = user.id
+    po.approved_at = utcnow()
+    po.updated_at = utcnow()
+
+    requester = db.query(User).filter(User.id == po.requester_id).first()
+    _record(db, po, "APPROVED", user.id, old, po.status,
+            recipient=requester.email if requester else None,
+            subject=f"Your Purchase Order {po.po_number} has been approved",
+            body=_po_html(po, f"Your Purchase Order was approved by {user.full_name}.")
+                 + f"<p><b>Remarks:</b> {remarks or 'None'}</p>",
+            extra={"remarks": remarks})
+
+    # COMPLETED makes the shared document generator create a PDF.
+    _record(db, po, "COMPLETED", user.id, po.status, po.status,
+            extra={"approved_by": user.full_name, "remarks": remarks})
+
+    db.commit()
+    db.refresh(po)
+    return po
+
+
+def reject_purchase_order(db: Session, po: PurchaseOrder, user: User, reason: str):
+    if po.status != "PENDING_APPROVAL":
+        raise ValueError("Only Purchase Orders pending approval can be rejected.")
+    if not can_decide(po, user):
+        raise PermissionError("You are not allowed to reject this Purchase Order.")
+    if not reason or not reason.strip():
+        raise ValueError("A rejection reason is required.")
+
+    old = po.status
+    po.status = "REJECTED"
+    po.approver_id = user.id
+    po.rejection_reason = reason.strip()
+    po.rejected_at = utcnow()
+    po.updated_at = utcnow()
+
+    requester = db.query(User).filter(User.id == po.requester_id).first()
+    _record(db, po, "REJECTED", user.id, old, po.status,
+            recipient=requester.email if requester else None,
+            subject=f"Your Purchase Order {po.po_number} has been rejected",
+            body=_po_html(po, f"Your Purchase Order was rejected by {user.full_name}.")
+                 + f"<p><b>Reason:</b> {po.rejection_reason}</p>",
+            extra={"reason": po.rejection_reason})
+    db.commit()
+    db.refresh(po)
+    return po
+
+
+def resubmit_purchase_order(db: Session, po: PurchaseOrder, user: User):
+    if po.status != "REJECTED":
+        raise ValueError("Only REJECTED Purchase Orders can be resubmitted.")
+    if po.requester_id != user.id:
+        raise PermissionError("You can only resubmit your own Purchase Order.")
+
+    approver = find_approver(db, user)
+    if not approver:
+        raise ValueError("No approver available.")
+
+    old = po.status
+    po.status = "PENDING_APPROVAL"
+    po.approver_id = approver.id
+    po.submitted_at = utcnow()
+    po.rejected_at = None
+    po.rejection_reason = None
+    po.updated_at = utcnow()
+
+    _record(db, po, "RESUBMITTED", user.id, old, po.status,
+            recipient=approver.email,
+            subject=f"Purchase Order {po.po_number} was resubmitted",
+            body=_po_html(po, f"{user.full_name} corrected and resubmitted this Purchase Order."))
+    db.commit()
+    db.refresh(po)
+    return po
+
+
+def cancel_purchase_order(db: Session, po: PurchaseOrder, user: User):
+    if po.requester_id != user.id and user.role != "hr_admin":
+        raise PermissionError("You can only cancel your own Purchase Order.")
+    if po.status not in CANCELLABLE_STATUSES:
+        raise ValueError("This Purchase Order cannot be cancelled.")
+
+    old = po.status
+    po.status = "CANCELLED"
+    po.updated_at = utcnow()
+    _record(db, po, "CANCELLED", user.id, old, po.status)
+    db.commit()
+    db.refresh(po)
+    return po
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\tasks\escalation.py =====
+
+from datetime import datetime, timezone
+
+from celery_app import celery_app
+from database import SessionLocal
+from models import ApprovalHistory, LeaveRequest, StatusEnum, User
+from tasks.notifications import send_email
+
+
+@celery_app.task
+def check_and_escalate():
+    db = SessionLocal()
+    try:
+        open_requests = db.query(LeaveRequest).filter(
+            LeaveRequest.status.in_(["pending", "escalated"])
+        ).all()
+
+        for request in open_requests:
+            hours_pending = (
+                datetime.now(timezone.utc) - request.created_at.replace(tzinfo=timezone.utc)
+            ).total_seconds() / 3600
+
+            if hours_pending >= 2/60 and request.escalation_level == "manager_l1":
+                escalate_request.delay(str(request.id), "manager_l2")
+            elif hours_pending >=4/60 and request.escalation_level == "manager_l2":
+                escalate_request.delay(str(request.id), "hr_admin")
+    finally:
+        db.close()
+
+
+@celery_app.task
+def escalate_request(request_id: str, escalate_to: str):
+    db = SessionLocal()
+    try:
+        request = db.query(LeaveRequest).filter(LeaveRequest.id == request_id).first()
+        if not request:
+            return {"error": "Request not found"}
+
+        new_approver = db.query(User).filter(
+            User.role == escalate_to,
+            User.is_active == True,
+        ).first()
+        if not new_approver:
+            return {"error": f"No approver found for role {escalate_to}"}
+
+        request.escalation_level = escalate_to
+        request.current_approver_id = new_approver.id
+        request.status = StatusEnum.escalated
+        request.escalated_at = datetime.now(timezone.utc)
+
+        db.add(ApprovalHistory(
+            request_id=request.id,
+            actor_id=new_approver.id,
+            action="escalated",
+            comments=f"Auto-escalated to {escalate_to}",
+        ))
+        db.commit()
+
+        send_email(
+            new_approver.email,
+            f"Escalated Leave Request: {request.leave_type}",
+            f"<p>A request has been escalated to you.</p>"
+            f"<p><b>Leave Type:</b> {request.leave_type}</p>"
+            f"<p><b>Reason:</b> {request.reason}</p>",
+        )
+        return {"status": "escalated", "request_id": request_id}
+    finally:
+        db.close()
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\tasks\notifications.py =====
+
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from celery_app import celery_app
+from config import settings
+
+
+@celery_app.task
+def send_email_notification(to_email: str, subject: str, body: str):
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = settings.SMTP_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "html"))
+
+        if settings.SMTP_USER and settings.SMTP_PASSWORD:
+            server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+            server.starttls()
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.send_message(msg)
+            server.quit()
+        else:
+            print(f"[EMAIL MOCK] To: {to_email} | Subject: {subject}")
+            print(f"[EMAIL MOCK] Body: {body}")
+
+        return {"status": "sent", "to": to_email}
+    except Exception as e:
+        print(f"Email error: {e}")
+        return {"status": "failed", "error": str(e)}
+
+
+def send_email(to_email: str, subject: str, body: str) -> str:
+    """Use Celery if it's turned on, otherwise send right away.
+
+    Without SMTP settings, the email is printed in the terminal as [EMAIL MOCK].
+    """
+    if settings.USE_CELERY:
+        try:
+            send_email_notification.delay(to_email, subject, body)
+            return "queued"
+        except Exception as exc:
+            print(f"Celery/Redis not available, sending directly: {exc}")
+
+    result = send_email_notification(to_email, subject, body)
+    return result.get("status", "sent")
+
+===== C:\Users\anany\Desktop\approval-platform\backend_merged\tasks\__init__.py =====
+

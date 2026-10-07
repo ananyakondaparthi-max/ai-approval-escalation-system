@@ -1,0 +1,109 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Automated Approval Escalation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ========== LOGIN PAGE ========== -->
+<div id="login-view">
+  <div class="login-card">
+    <h1>Automated Approval Escalation</h1>
+    <p class="muted">Sign in to continue</p>
+    <form id="login-form">
+      <label>Email</label>
+      <input type="email" id="login-email" required>
+      <label>Password</label>
+      <input type="password" id="login-password" required>
+      <button type="submit" class="btn primary full">Sign in</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+</div>
+
+<!-- ========== APP (after login) ========== -->
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <span class="brand" onclick="showPage('home')">ERP</span>
+    <span id="user-info" class="muted"></span>
+    <button class="btn small" onclick="logout()">Log out</button>
+  </header>
+
+  <main>
+    <!-- HOME: 3 options -->
+    <section id="page-home" class="page">
+      <h2>What would you like to do?</h2>
+      <div class="cards">
+        <div class="card" onclick="showPage('leave')">
+          <div class="icon">🗓️</div>
+          <h3>Leave Requests</h3>
+          <p>Apply for leave and track approvals</p>
+        </div>
+        <div class="card" onclick="showPage('po')">
+          <div class="icon">🧾</div>
+          <h3>Purchase Orders</h3>
+          <p>Create, submit and approve purchase orders</p>
+        </div>
+        <div class="card" onclick="showPage('erp')">
+          <div class="icon">🏫</div>
+          <h3>ERP</h3>
+          <p>University records and administration</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- PURCHASE ORDERS -->
+    <section id="page-po" class="page hidden">
+      <button class="link" onclick="showPage('home')">← Back to home</button>
+      <h2>Purchase Orders</h2>
+
+      <div class="box">
+        <h3>New purchase order</h3>
+        <form id="po-form">
+          <div class="grid">
+            <input name="department" placeholder="Department" required>
+            <input name="vendor_name" placeholder="Vendor name" required>
+            <input name="vendor_email" placeholder="Vendor email">
+            <input name="vendor_phone" placeholder="Vendor phone">
+          </div>
+          <input name="purpose" placeholder="Purpose" required>
+          <textarea name="description" placeholder="Description"></textarea>
+
+          <h4>Items</h4>
+          <div id="po-items"></div>
+          <button type="button" class="btn small" onclick="addItemRow()">+ Add item</button>
+          <p>Total: <b>₹<span id="po-total">0.00</span></b></p>
+
+          <button type="submit" class="btn primary">Save as draft</button>
+          <p id="po-msg" class="muted"></p>
+        </form>
+      </div>
+
+      <div class="box">
+        <h3>Purchase orders</h3>
+        <div id="po-list"></div>
+      </div>
+    </section>
+
+    <!-- LEAVE REQUESTS (connected in next step) -->
+    <section id="page-leave" class="page hidden">
+      <button class="link" onclick="showPage('home')">← Back to home</button>
+      <h2>Leave Requests</h2>
+      <div class="box muted">This section will be connected in the next step.</div>
+    </section>
+
+    <!-- ERP (connected in next step) -->
+    <section id="page-erp" class="page hidden">
+      <button class="link" onclick="showPage('home')">← Back to home</button>
+      <h2>Automated Approval Escalation</h2>
+      <div class="box muted">This section will be connected in the next step.</div>
+    </section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

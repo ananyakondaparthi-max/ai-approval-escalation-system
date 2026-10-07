@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0.41
+pydantic>=2.12
+pydantic-settings
+python-jose[cryptography]
+passlib==1.7.4
+bcrypt==4.0.1
+python-multipart
+email-validator
+httpx
+reportlab
+celery
+redis

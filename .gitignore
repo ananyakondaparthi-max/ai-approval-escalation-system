@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+*.db
+*.sqlite
+.pytest_cache/
+.vscode/
+node_modules/
+backend_merged/generated_documents/
